@@ -1,0 +1,7 @@
+certs/
+*.pem
+*.crt
+*.key
+__pycache__/
+*.save
+.env
