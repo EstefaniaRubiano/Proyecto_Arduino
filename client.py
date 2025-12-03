@@ -1,6 +1,7 @@
 import paho.mqtt.client as mqtt
 import mysql.connector
 import json
+from datetime import datetime, timedelta
 
 # -------------------------------
 # Configuració MQTT
@@ -26,53 +27,91 @@ cursor = db.cursor()
 DISPOSITIU_ID = 1  # ID del dispositiu a la tabla dispositius
 
 # -------------------------------
-# Conprovació de connexió
+# Funcions auxiliars
+# -------------------------------
+def calcular_estat(usuari_id):
+    """Calcula el tipus de lectura: entrada o sortida segons la última lectura"""
+    cursor.execute("""
+        SELECT tipus, data_hora
+        FROM lecturas
+        WHERE usuari_id = %s
+        ORDER BY data_hora DESC
+        LIMIT 1
+    """, (usuari_id,))
+    last_row = cursor.fetchone()
+    now = datetime.now()
+
+    if not last_row:
+        return 'entrada'
+    
+    last_tipus, last_time = last_row
+    # Evitar doble registre en menys de 5 minuts
+    if (now - last_time).total_seconds() < 300:
+        return None  # Indica que no registrar
+    
+    return 'entrada' if last_tipus == 'sortida' else 'sortida'
+
+def registrar_lectura(usuari_id, tipus):
+    """Inserta una nova lectura i retorna el seu id"""
+    data_hora = datetime.now()
+    sql = "INSERT INTO lecturas (usuari_id, dispositiu_id, tipus, data_hora) VALUES (%s, %s, %s, %s)"
+    cursor.execute(sql, (usuari_id, DISPOSITIU_ID, tipus, data_hora))
+    db.commit()
+    return cursor.lastrowid
+
+def registrar_assistencia(usuari_id, lectura_id):
+    """Inserta un registre en assistencies"""
+    estat = 'present'  # Sol es registra present
+    sql = "INSERT INTO assistencies (usuari_id, dispositiu_id, estat, lectura_id) VALUES (%s, %s, %s, %s)"
+    cursor.execute(sql, (usuari_id, DISPOSITIU_ID, estat, lectura_id))
+    db.commit()
+    return estat
+
+# -------------------------------
+# Conprovació de connexió MQTT
 # -------------------------------
 def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("Connectat a MQTT correctament")
-        client.subscribe(MQTT_TOPIC)
-        print(f"Subscrit al topic: {MQTT_TOPIC}")
-    else:
-        print(f"Error de connexió, codi: {rc}")
+    if rc != 0:
+        print(f"[ERROR] Connexió MQTT fallida, codi: {rc}")
+    client.subscribe(MQTT_TOPIC)
 
 # -------------------------------
 # Funció al rebre missatge MQTT
 # -------------------------------
 def on_message(client, userdata, message):
-    payload = message.payload.decode()
-    print(f"Missatge rebut: {payload}")
-
     try:
-        data = json.loads(payload)
+        data = json.loads(message.payload.decode())
         uid = data.get("tag", None)
-    except:
-        uid = None
+    except Exception as e:
+        print(f"[ERROR] Payload invàlid: {e}")
+        return
 
-    if uid:
-        # Buscar usuari per UID
-        cursor.execute("SELECT id FROM usuaris WHERE rfid_uid=%s", (uid,))
-        result = cursor.fetchone()
+    if not uid:
+        print("[ERROR] UID no rebut")
+        return
 
-        if result:
-            usuari_id = result[0]
-            # Obtener el nom del usuari
-            cursor.execute("SELECT nom FROM usuaris WHERE id=%s", (usuari_id,))
-            nom_result = cursor.fetchone()
-            nom_usuari = nom_result[0] if nom_result else "Desconegut"
+    # Buscar usuari per UID
+    cursor.execute("SELECT id, nom FROM usuaris WHERE rfid_uid=%s", (uid,))
+    result = cursor.fetchone()
 
-            # Insertar a assistencies
-            cursor.execute(
-                "INSERT INTO assistencies (usuari_id, dispositiu_id, estat) VALUES (%s, %s, %s)",
-                (usuari_id, DISPOSITIU_ID, 'present')
-            )
-            db.commit()
-            #print(f"Assistència guardada per l'usuari_id={usuari_id}")
-            print(f"Assistència guardada per l'usuari: {nom_usuari} (id={usuari_id})")
-        else:
-            print(f"UID no trobat a usuaris: {uid}")
-    else:
-        print("Error: UID no rebut")
+    if not result:
+        print(f"[ERROR] UID no trobat a usuaris: {uid}")
+        return
+
+    usuari_id, nom_usuari = result
+
+    # Determinar tipus (entrada/sortida) segons última lectura
+    tipus = calcular_estat(usuari_id)
+    if tipus is None:
+        print(f"[AVÍS] Usuari {nom_usuari} ja ha passat la targeta fa poc.")
+        return
+
+    # Registrar lectura
+    lectura_id = registrar_lectura(usuari_id, tipus)
+    # Registrar assistència
+    estat = registrar_assistencia(usuari_id, lectura_id)
+
+    print(f"Assistència registrada per l'usuari: {nom_usuari} (id={usuari_id}), tipus={tipus}")
 
 # -------------------------------
 # Configurar client MQTT
@@ -88,8 +127,9 @@ client.tls_set(
     keyfile="certs/private.pem.key"
 )
 
-client.connect(MQTT_BROKER, MQTT_PORT)
-client.subscribe(MQTT_TOPIC)
-
-print("Esperant missatges MQTT...")
-client.loop_forever()
+try:
+    client.connect(MQTT_BROKER, MQTT_PORT)
+    print("Esperant missatges MQTT...")
+    client.loop_forever()
+except Exception as e:
+    print(f"[ERROR] No s'ha pogut connectar a MQTT: {e}")
