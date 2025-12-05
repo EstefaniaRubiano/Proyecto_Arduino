@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 # -------------------------------
 # Configuració MQTT
 # -------------------------------
-MQTT_BROKER = "arcxnujtdwkhj-ats.iot.us-east-1.amazonaws.com"  # Endpoint d'AWS
+MQTT_BROKER = "arcxnujtdwkhj-ats.iot.us-east-1.amazonaws.com"
 MQTT_PORT = 8883
 MQTT_TOPIC = "iticbcn/espnode01/pub"
 
@@ -24,13 +24,13 @@ cursor = db.cursor()
 # -------------------------------
 # Configuració dispositiu (prova)
 # -------------------------------
-DISPOSITIU_ID = 1  # ID del dispositiu a la tabla dispositius
+DISPOSITIU_ID = 1
 
 # -------------------------------
 # Funcions auxiliars
 # -------------------------------
 def calcular_estat(usuari_id):
-    """Calcula el tipus de lectura: entrada o sortida segons la última lectura"""
+    """Determina entrada/salida según la última lectura"""
     cursor.execute("""
         SELECT tipus, data_hora
         FROM lecturas
@@ -43,27 +43,69 @@ def calcular_estat(usuari_id):
 
     if not last_row:
         return 'entrada'
-    
+
     last_tipus, last_time = last_row
-    # Evitar doble registre en menys de 5 minuts
-    if (now - last_time).total_seconds() < 300:
-        return None  # Indica que no registrar
-    
+    if (now - last_time).total_seconds() < 300:  # Evita doble registro
+        return None
+
     return 'entrada' if last_tipus == 'sortida' else 'sortida'
 
+def determinar_assignatura(usuari_id):
+    """Devuelve assignatura_id según hora, día y matrícula"""
+    now = datetime.now()
+
+    # Map inglés -> catalán
+    mapa_dies = {
+        'Monday': 'Dilluns',
+        'Tuesday': 'Dimarts',
+        'Wednesday': 'Dimecres',
+        'Thursday': 'Dijous',
+        'Friday': 'Divendres',
+        'Saturday': 'Dissabte',
+        'Sunday': 'Diumenge'
+    }
+    dia_setmana = mapa_dies[now.strftime('%A')]
+    hora_actual = now.time()
+
+    # Buscar asignaturas del usuario según matrícula
+    cursor.execute("""
+        SELECT h.assignatura_id, h.hora_inici, h.hora_fi
+        FROM horari h
+        JOIN matricula m ON h.assignatura_id = m.assignatura_id
+        WHERE m.usuari_id = %s AND h.dia_setmana = %s
+    """, (usuari_id, dia_setmana))
+    rows = cursor.fetchall()
+
+    for assignatura_id, hora_inici, hora_fi in rows:
+
+        #  Convertir posibles valores tipo timedelta a time
+        if isinstance(hora_inici, datetime):
+            hora_inici = hora_inici.time()
+        elif isinstance(hora_inici, timedelta):
+            hora_inici = (datetime.min + hora_inici).time()
+
+        if isinstance(hora_fi, datetime):
+            hora_fi = hora_fi.time()
+        elif isinstance(hora_fi, timedelta):
+            hora_fi = (datetime.min + hora_fi).time()
+
+        #  Comparación simple
+        if hora_inici <= hora_actual <= hora_fi:
+            return assignatura_id
+
+    return None  # No hay asignatura en este horario
+
 def registrar_lectura(usuari_id, tipus):
-    """Inserta una nova lectura i retorna el seu id"""
     data_hora = datetime.now()
     sql = "INSERT INTO lecturas (usuari_id, dispositiu_id, tipus, data_hora) VALUES (%s, %s, %s, %s)"
     cursor.execute(sql, (usuari_id, DISPOSITIU_ID, tipus, data_hora))
     db.commit()
     return cursor.lastrowid
 
-def registrar_assistencia(usuari_id, lectura_id):
-    """Inserta un registre en assistencies"""
-    estat = 'present'  # Sol es registra present
-    sql = "INSERT INTO assistencies (usuari_id, dispositiu_id, estat, lectura_id) VALUES (%s, %s, %s, %s)"
-    cursor.execute(sql, (usuari_id, DISPOSITIU_ID, estat, lectura_id))
+def registrar_assistencia(usuari_id, lectura_id, assignatura_id):
+    estat = 'present'
+    sql = "INSERT INTO assistencies (usuari_id, dispositiu_id, estat, lectura_id, assignatura_id) VALUES (%s, %s, %s, %s, %s)"
+    cursor.execute(sql, (usuari_id, DISPOSITIU_ID, estat, lectura_id, assignatura_id))
     db.commit()
     return estat
 
@@ -90,28 +132,30 @@ def on_message(client, userdata, message):
         print("[ERROR] UID no rebut")
         return
 
-    # Buscar usuari per UID
     cursor.execute("SELECT id, nom FROM usuaris WHERE rfid_uid=%s", (uid,))
     result = cursor.fetchone()
-
     if not result:
         print(f"[ERROR] UID no trobat a usuaris: {uid}")
         return
 
     usuari_id, nom_usuari = result
 
-    # Determinar tipus (entrada/sortida) segons última lectura
     tipus = calcular_estat(usuari_id)
     if tipus is None:
         print(f"[AVÍS] Usuari {nom_usuari} ja ha passat la targeta fa poc.")
         return
 
-    # Registrar lectura
     lectura_id = registrar_lectura(usuari_id, tipus)
-    # Registrar assistència
-    estat = registrar_assistencia(usuari_id, lectura_id)
 
-    print(f"Assistència registrada per l'usuari: {nom_usuari} (id={usuari_id}), tipus={tipus}")
+    assignatura_id = determinar_assignatura(usuari_id)
+    registrar_assistencia(usuari_id, lectura_id, assignatura_id)
+
+    if assignatura_id:
+        cursor.execute("SELECT nom FROM assignatures WHERE id=%s", (assignatura_id,))
+        nom_assignatura = cursor.fetchone()[0]
+        print(f"Assistència registrada per l'usuari: {nom_usuari} (id={usuari_id}), tipus={tipus}, assignatura: {nom_assignatura}")
+    else:
+        print(f"Assistència registrada per l'usuari: {nom_usuari} (id={usuari_id}), tipus={tipus}, assignatura: No disponible")
 
 # -------------------------------
 # Configurar client MQTT
@@ -120,7 +164,6 @@ client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
 
-# Connexió TLS amb certificats
 client.tls_set(
     ca_certs="certs/AmazonRootCA1.pem",
     certfile="certs/certificate.pem.crt",
